@@ -44,3 +44,13 @@ WORKDIR SparseConvNet/
 
 RUN rm -rf build/ dist/ sparseconvnet.egg-info sparseconvnet_SCN*.so
 RUN python setup.py develop
+
+WORKDIR ~
+RUN git clone https://github.com/wandb/client
+WORKDIR client
+RUN git checkout feature/object-3D
+RUN pip install -e .
+
+WORKDIR /~/SparseConvNet
+ENV LC_ALL=C.UTF-8
+ENV LANG=C.UTF-8

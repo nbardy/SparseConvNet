@@ -6,6 +6,8 @@
 
 import torch
 import sparseconvnet as scn
+import wandb
+
 
 # Use the GPU if there is one, otherwise CPU
 use_cuda = torch.cuda.is_available()
@@ -24,6 +26,9 @@ model = scn.Sequential().add(
 )
 if use_cuda:
     model.cuda()
+
+wandb.init()
+wandb.watch(model)
 
 # output will be 10x10
 inputSpatialSize = model.input_spatial_size(torch.LongTensor([10, 10]))

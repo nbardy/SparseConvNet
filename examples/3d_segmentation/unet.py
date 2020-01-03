@@ -1,9 +1,8 @@
-# Copyright 2016-present, Facebook, Inc.
+#t Copyright 2016-present, Facebook, Inc.
 # All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
 import torch, data
 import torch.nn as nn
 import torch.optim as optim
@@ -13,18 +12,43 @@ import time
 import os, sys
 import math
 import numpy as np
+import wandb
+import argparse
 
-data.init(-1,24,24*8,16)
+parser = argparse.ArgumentParser(description='Process some integers.')
+
+parser.add_argument('--category', default=1, type=int)
+parser.add_argument('--lr', default=1e-1, type=float)
+parser.add_argument('--lr_decay', default=4e-2, type=float)
+parser.add_argument('--weight_decay', default=1e-4, type=float)
+parser.add_argument('--momentum', default=0.9, type=float)
+args = parser.parse_args()
+
+p={}
+p['n_epochs'] = 200
+p['initial_lr'] = args.lr
+p['lr_decay'] = args.lr_decay
+p['weight_decay'] = args.weight_decay
+p['momentum'] = args.momentum
+p['check_point'] = False
+p['use_cuda'] = torch.cuda.is_available()
+
+wandb.init()
+wandb.config.update(args, allow_val_change=True)
+
+# data.init(-1,24,24*8,16)
+print(args)
+data.init(int(args.category),24,24*8,16)
 dimension = 3
 reps = 1 #Conv block repetition factor
 m = 32 #Unet number of features
 nPlanes = [m, 2*m, 3*m, 4*m, 5*m] #UNet number of features per level
 
+
 class Model(nn.Module):
     def __init__(self):
         nn.Module.__init__(self)
-        self.sparseModel = scn.Sequential().add(
-           scn.InputLayer(dimension, data.spatialSize, mode=3)).add(
+        self.sparseModel = scn.Sequential().add( scn.InputLayer(dimension, data.spatialSize, mode=3)).add(
            scn.SubmanifoldConvolution(dimension, 1, m, 3, False)).add(
            scn.UNet(dimension, reps, nPlanes, residual_blocks=False, downsample=[2,2])).add(
            scn.BatchNormReLU(m)).add(
@@ -36,20 +60,11 @@ class Model(nn.Module):
         return x
 
 model=Model()
-print(model)
+wandb.watch(model)
 trainIterator=data.train()
 validIterator=data.valid()
 
 criterion = nn.CrossEntropyLoss()
-p={}
-p['n_epochs'] = 100
-p['initial_lr'] = 1e-1
-p['lr_decay'] = 4e-2
-p['weight_decay'] = 1e-4
-p['momentum'] = 0.9
-p['check_point'] = False
-p['use_cuda'] = torch.cuda.is_available()
-wandb.init(config=p)
 
 dtype = 'torch.cuda.FloatTensor' if p['use_cuda'] else 'torch.FloatTensor'
 dtypei = 'torch.cuda.LongTensor' if p['use_cuda'] else 'torch.LongTensor'
@@ -94,16 +109,30 @@ def union(pred, gt, label):
     assert pred.size == gt.size, 'Predictions incomplete!'
     return np.sum(np.logical_or(pred.astype('int') == label, gt.astype('int') == label))
 
-def log_point_clouds(x, y, predictions):
-    print(x)
-    print(y)
-    print(predictions);
-    print(x.shape)
-    print(y.shape)
-    print(predictions.shape);
-    wandb.log({"test_data": wandb.Object3D(batch['x'][0].numpy()),
-               "true_labels": wandb.Object3D(predictions.numpy()),
-               "prediction_data": wandb.Object3D(predictions.numpy())})
+def point_cloud_examples(x, y, predictions, splits):
+    input_data = x[0].numpy()
+    points = input_data[:,:3]
+
+    ## Create y label point cloud
+    # Wrap for concat
+    y_numpy = y.cpu().numpy()
+    y_labels = np.expand_dims(y_numpy, axis=1)
+    points_with_y_label = np.concatenate((points,y_labels), axis=1)
+
+    ## Transform loss predictions into a point cloud with labels
+    predictions_numpy = predictions.detach().cpu().numpy()
+    predictions_highest = predictions_numpy.argmax(axis=1)
+    predictions_labels = np.expand_dims(predictions_highest, axis=1)
+    points_with_predictions_label = np.concatenate((points,predictions_labels), axis=1)
+    
+    idxs = np.cumsum(splits)
+    xs = np.split(input_data, idxs)
+    ys = np.split(points_with_y_label, idxs)
+    ps = np.split(points_with_predictions_label, idxs)
+    
+    return {"x": [wandb.Object3D(x) for x in xs],
+            "y": [wandb.Object3D(y) for y in ys],
+            "predictions": [wandb.Object3D(p) for p in ps]}
 
 def iou(stats):
     eps = sys.float_info.epsilon
@@ -147,10 +176,13 @@ for epoch in range(p['epoch'], p['n_epochs'] + 1):
         batch['y']=batch['y'].type(dtypei)
         batch['mask']=batch['mask'].type(dtype)
         predictions=model(batch['x'])
-        loss = criterion.forward(predictions,batch['y'])
+
+        # Comparse prediction 
+        loss = criterion.forward(predictions,batch['y']) 
         store(stats,batch,predictions,loss)
         loss.backward()
         optimizer.step()
+
     r = iou(stats)
     wandb.log({'train epoch': epoch, 'iou': r['iou'], 'iou_all': r['iou_all'], 'MegaMulAdd=': scn.forward_pass_multiplyAdd_count/r['nmodels_sum']/1e6, 'MegaHidden': scn.forward_pass_hidden_states/r['nmodels_sum']/1e6, 'time': time.time() - start})
 
@@ -158,7 +190,8 @@ for epoch in range(p['epoch'], p['n_epochs'] + 1):
         torch.save(epoch, 'epoch.pth')
         torch.save(model.state_dict(),'model.pth')
 
-    if epoch in [10,30,100]:
+    examples = None;
+    if epoch in [1,10,30,100]:
         model.eval()
         stats = {}
         scn.forward_pass_multiplyAdd_count=0
@@ -170,12 +203,17 @@ for epoch in range(p['epoch'], p['n_epochs'] + 1):
                 batch['y']=batch['y'].type(dtypei)
                 batch['mask']=batch['mask'].type(dtype)
                 predictions=model(batch['x'])
-                # What to log?: 
-                #   1) Input to model
-                #   2) Output from model
-                #   3) Ground truth
-                logPointClouds(batch['x'], batch['y'], predictions)
+                examples = point_cloud_examples(batch['x'], batch['y'], predictions, batch['nPoints'])
                 loss = criterion.forward(predictions,batch['y'])
                 store(stats,batch,predictions,loss)
             r = iou(stats)
-	    wandb.log({'train epoch': epoch, 'iou': r['iou'], 'iou_all': r['iou_all'], 'MegaMulAdd=': scn.forward_pass_multiplyAdd_count/r['nmodels_sum']/1e6, 'MegaHidden': scn.forward_pass_hidden_states/r['nmodels_sum']/1e6, 'time': time.time() - start})
+            log_data = {'train epoch': epoch, 
+	                'iou': r['iou'], 
+	                'iou_all': r['iou_all'], 
+	                'MegaMulAdd=': scn.forward_pass_multiplyAdd_count/r['nmodels_sum']/1e6, 
+	                'MegaHidden': scn.forward_pass_hidden_states/r['nmodels_sum']/1e6, 
+	                'time': time.time() - start}
+
+            with_ex = {**examples, **log_data}
+            print("wlog", with_ex)
+            wandb.log(with_ex)

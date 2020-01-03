@@ -59,7 +59,6 @@ def train():
             num_workers=12):
             d.append(x)
 
-    print(len(d))
     def merge(tbl):
         xl_=[]
         xf_=[]
